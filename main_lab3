@@ -1,0 +1,134 @@
+import os
+from datetime import datetime
+from dotenv import load_dotenv
+from fastapi import FastAPI
+from sqlalchemy import create_engine, Column, Integer, String, Boolean, DateTime, ForeignKey, func
+from sqlalchemy.orm import sessionmaker, declarative_base, relationship
+
+Base = declarative_base()
+
+class ToDoList(Base):
+    __tablename__ = "todo_lists"
+
+    id = Column(Integer, primary_key=True)
+    name = Column(String)
+    total_items = Column(Integer, default=0)
+    completed_items = Column(Integer, default=0)
+    deleted_at = Column(DateTime, nullable=True)
+
+    items = relationship("Item", back_populates="todo_list")
+
+class Item(Base):
+    __tablename__ = "items"
+
+    id = Column(Integer, primary_key=True)
+    text = Column(String)
+    is_done = Column(Boolean, default=False)
+    deleted_at = Column(DateTime, nullable=True)
+    todo_list_id = Column(Integer, ForeignKey("todo_lists.id"))
+
+    todo_list = relationship("ToDoList", back_populates="items")
+
+load_dotenv()
+
+url = (f"postgresql://{os.getenv('DB_USER')}:{os.getenv('DB_PASSWORD')}@"
+       f"{os.getenv('DB_HOST')}:{os.getenv('DB_PORT')}/{os.getenv('DB_NAME')}")
+
+engine = create_engine(url)
+Session = sessionmaker(bind=engine)
+session = Session()
+
+Base.metadata.create_all(engine)
+
+app = FastAPI()
+
+@app.get("/")
+async def get_all_todo_lists():
+    lists = session.query(ToDoList).filter(ToDoList.deleted_at.is_(None)).all()
+    response = []
+    for todo_list in lists:
+        progress = 0
+        if todo_list.total_items > 0:
+            progress = int((todo_list.completed_items / todo_list.total_items) * 100)
+        response.append({
+            "id": todo_list.id,
+            "name": todo_list.name,
+            "progress": progress
+        })
+    return response
+
+@app.post("/create_list")
+async def create_todo_list(name: str):
+    new_list = ToDoList(name=name)
+    session.add(new_list)
+    session.commit()
+    return {"todo_list added": new_list.name}
+
+@app.post("/create_item")
+async def create_todo(text: str, list_id: int, is_complete: bool = False):
+    todo_item = Item(text=text, is_done=is_complete, todo_list_id=list_id)
+    session.add(todo_item)
+
+    todo_list = session.query(ToDoList).filter(ToDoList.id == list_id, ToDoList.deleted_at.is_(None)).first()
+    if todo_list:
+        todo_list.total_items += 1
+        if is_complete:
+            todo_list.completed_items += 1
+        session.add(todo_list)
+
+    session.commit()
+    return {"todo added": todo_item.text}
+
+@app.put("/update/{id}")
+async def update_todo(id: int, new_text: str = "", is_complete: bool = False):
+    todo = session.query(Item).filter(Item.id == id, Item.deleted_at.is_(None)).first()
+    if not todo:
+        return {"error": "Item not found"}
+
+    if new_text:
+        todo.text = new_text
+
+    if todo.is_done != is_complete:
+        delta = 1 if is_complete else -1
+        todo_list = todo.todo_list
+        if todo_list:
+            todo_list.completed_items += delta
+            session.add(todo_list)
+
+    todo.is_done = is_complete
+    session.add(todo)
+    session.commit()
+    return {"todo updated": todo.id}
+
+@app.delete("/delete_item/{id}")
+async def delete_todo(id: int):
+    todo = session.query(Item).filter(Item.id == id, Item.deleted_at.is_(None)).first()
+    if not todo:
+        return {"error": "Item not found"}
+
+    todo.deleted_at = datetime.utcnow()
+    todo_list = todo.todo_list
+    if todo_list:
+        todo_list.total_items -= 1
+        if todo.is_done:
+            todo_list.completed_items -= 1
+        session.add(todo_list)
+
+    session.add(todo)
+    session.commit()
+    return {"todo soft-deleted": todo.text}
+
+@app.delete("/delete_list/{id}")
+async def delete_todo_list(id: int):
+    todo_list = session.query(ToDoList).filter(ToDoList.id == id, ToDoList.deleted_at.is_(None)).first()
+    if not todo_list:
+        return {"error": "ToDoList not found"}
+
+    todo_list.deleted_at = datetime.utcnow()
+    for item in todo_list.items:
+        item.deleted_at = datetime.utcnow()
+        session.add(item)
+
+    session.add(todo_list)
+    session.commit()
+    return {"todo list soft-deleted": todo_list.name}
